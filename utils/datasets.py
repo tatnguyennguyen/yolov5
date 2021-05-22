@@ -1062,3 +1062,32 @@ def autosplit(path='../coco128', weights=(0.9, 0.1, 0.0), annotated_only=False):
         if not annotated_only or Path(img2label_paths([str(img)])[0]).exists():  # check label
             with open(path / txt[i], 'a') as f:
                 f.write(str(img) + '\n')  # add image to txt file
+
+
+class DataloaderFusion:
+    def __init__(self, list_dataloader):
+        self.list_dataloader = list_dataloader
+        self.list_iter = [iter(ld) for ld in self.list_dataloader]
+        self.n_dataset = len(list_dataloader)
+        self.len = 0
+        self.load_order = []
+        for i, dl in enumerate(list_dataloader):
+            self.len += len(dl)
+            self.load_order += [i for _ in range(len(dl))]
+        random.shuffle(self.load_order)
+        self.idx = -1
+
+    def __len__(self):
+        return self.len
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.idx += 1
+        if self.idx >= self.len:
+            raise StopIteration
+        else:
+            dataset_idx = self.load_order[self.idx]
+            data = next(self.list_iter[dataset_idx])
+            return data, dataset_idx

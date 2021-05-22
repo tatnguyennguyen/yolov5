@@ -63,6 +63,58 @@ class Detect(nn.Module):
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
 
+class DetectMultiple(nn.Module):
+    stride = None  # strides computed during build
+    export = False  # onnx export
+
+    def __init__(self, multiple_nc=[], anchors=(), ch=()):  # detection layer
+        super(DetectMultiple, self).__init__()
+        self.multiple_nc = multiple_nc  # number of classes
+        self.multiple_no = [int(nc) + 5 for nc in multiple_nc]  # number of outputs per anchor
+        self.n_dataset = len(self.multiple_nc)
+        self.no = sum(self.multiple_no)
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
+        self.register_buffer('anchors', a)  # shape(nl,na,2)
+        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.slice_index = []
+        start = 0
+        for n in self.multiple_nc:
+            self.slice_index.append([start, start+n+5])
+            start += (n+5)
+
+    def forward(self, x):
+        # x = x.copy()  # for profiling
+        z = []  # inference output
+        self.training |= self.export
+        for i in range(self.nl):
+            x[i] = self.m[i](x[i])  # conv
+            bs, _, ny, nx = x[i].shape
+            # x(bs,na*no,20,20) to x(bs,na,20,20,no)
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+
+            if not self.training:  # inference
+                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+
+                y = x[i].sigmoid()
+                for d_idx in range(self.n_dataset):
+                    start = self.slice_index[d_idx][0]
+                    y[..., start+0:start+2] = (y[..., start+0:start+2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    y[..., start+2:start+4] = (y[..., start+2:start+4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                z.append(y.view(bs, -1, self.no))
+
+        return x if self.training else (torch.cat(z, 1), x)
+
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+
 class Model(nn.Module):
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         super(Model, self).__init__()
@@ -89,6 +141,16 @@ class Model(nn.Module):
         # Build strides, anchors
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):
+            s = 256  # 2x min stride
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            m.anchors /= m.stride.view(-1, 1, 1)
+            check_anchor_order(m)
+            self.stride = m.stride
+            self._initialize_biases()  # only run once
+            # logger.info('Strides: %s' % m.stride.tolist())
+        
+        if isinstance(m, DetectMultiple):
+            # TODO
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             m.anchors /= m.stride.view(-1, 1, 1)
@@ -149,11 +211,23 @@ class Model(nn.Module):
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
-        for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
-            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        if isinstance(m, Detect):
+            for mi, s in zip(m.m, m.stride):  # from
+                b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
+                b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+                b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        elif isinstance(m, DetectMultiple):
+            n_dataset = m.n_dataset
+            slice_index = m.slice_index
+            multiple_nc = m.multiple_nc
+            for mi, s in zip(m.m, m.stride):  # from
+                b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
+                for didx in range(n_dataset):
+                    start, end = slice_index[didx]
+                b.data[:, start+4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+                b.data[:, start+5:end] += math.log(0.6 / (multiple_nc[didx] - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
         m = self.model[-1]  # Detect() module
@@ -231,7 +305,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum([ch[x] for x in f])
-        elif m is Detect:
+        elif m in [Detect, DetectMultiple]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

@@ -24,13 +24,13 @@ from tqdm import tqdm
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
-from utils.autoanchor import check_anchors
-from utils.datasets import create_dataloader
+from utils.autoanchor import check_anchors, check_anchors_multiple
+from utils.datasets import create_dataloader, DataloaderFusion
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
-from utils.loss import ComputeLoss
+from utils.loss import ComputeLoss, ComputeLossMultiple
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
@@ -64,6 +64,8 @@ def train(hyp, opt, device, tb_writer=None):
         data_dict = yaml.safe_load(f)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
 
+    n_dataset = data_dict.get('n_dataset', 1)  # number of dataset. 1 is default
+
     # Logging- Doing this before checking the dataset. Might update data_dict
     loggers = {'wandb': None}  # loggers dict
     if rank in [-1, 0]:
@@ -76,7 +78,20 @@ def train(hyp, opt, device, tb_writer=None):
             weights, epochs, hyp = opt.weights, opt.epochs, opt.hyp  # WandbLogger might update weights, epochs if resuming
 
     nc = 1 if opt.single_cls else int(data_dict['nc'])  # number of classes
-    names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
+    if n_dataset == 1:
+        names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
+    else:
+        names = []  # all names from all datasets. Make multiple dataset code compatiable with original single dataset code
+        multiple_names = []  # classes name for each dataset
+        multiple_nc = []  # number of classes for each dataset
+        for i in range(n_dataset):
+            list_name = data_dict['names_' + str(i+1)]
+            names += list_name  # make multiple dataset code compatiable with original single dataset code
+            multiple_names.append(list_name)
+            n_class = int(data_dict['nc_' + str(i+1)])
+            multiple_nc.append(n_class)
+            assert len(list_name) == n_class, 'len(name?) != nc?'  # check
+        assert sum(multiple_nc) == nc, "nc != sum(nc_*)"
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
@@ -95,8 +110,16 @@ def train(hyp, opt, device, tb_writer=None):
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
-    train_path = data_dict['train']
-    test_path = data_dict['val']
+
+    if n_dataset == 1:
+        train_path = data_dict['train']
+        test_path = data_dict['val']
+    else:
+        multiple_train_path = []
+        multiple_test_path = []
+        for i in range(n_dataset):
+            multiple_train_path.append(data_dict['train_' + str(i+1)])
+            multiple_test_path.append(data_dict['val_' + str(i+1)])
 
     # Freeze
     freeze = []  # parameter names to freeze (full or partial)
@@ -186,34 +209,75 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Using SyncBatchNorm()')
 
     # Trainloader
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+    multiple_dataloader = []
+    multiple_dataset = []
+    multiple_testloader = []
+    if n_dataset == 1:
+        dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                                world_size=opt.world_size, workers=opt.workers,
+                                                image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+        mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
+        nb = len(dataloader)  # number of batches
+        assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
+
+        # Process 0
+        if rank in [-1, 0]:
+            testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
+                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
+                                        world_size=opt.world_size, workers=opt.workers,
+                                        pad=0.5, prefix=colorstr('val: '))[0]
+
+            if not opt.resume:
+                labels = np.concatenate(dataset.labels, 0)
+                c = torch.tensor(labels[:, 0])  # classes
+                # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
+                # model._initialize_biases(cf.to(device))
+                if plots:
+                    plot_labels(labels, names, save_dir, loggers)
+                    if tb_writer:
+                        tb_writer.add_histogram('classes', c, 0)
+
+                # Anchors
+                if not opt.noautoanchor:
+                    check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+                model.half().float()  # pre-reduce anchor precision
+    else:
+        nb = 0
+        for i, (train_path_one, test_path_one) in enumerate(zip(multiple_train_path, multiple_test_path)):
+            dataloader_one, dataset_one = create_dataloader(train_path_one, imgsz, batch_size, gs, opt,
+                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                                world_size=opt.world_size, workers=opt.workers,
+                                                image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train_' + str(i+1) + ': '))
+            mlc = np.concatenate(dataset_one.labels, 0)[:, 0].max()  # max label class
+            nb += len(dataloader_one)  # number of batches
+            assert mlc < multiple_nc[i], 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, multiple_nc[i], opt.data, nc - 1)
+
+            multiple_dataloader.append(dataloader_one)
+            multiple_dataset.append(dataset_one)
+
+            # Process 0
+            if rank in [-1, 0]:
+                # I don't know why this is only loader, not a tuple (loader, dataset)
+                testloader_one = create_dataloader(test_path_one, imgsz_test, batch_size * 2, gs, opt,  # testloader
+                                            hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
                                             world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
-    mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
-    nb = len(dataloader)  # number of batches
-    assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
+                                            pad=0.5, prefix=colorstr('val_' + str(i+1) + ': '))[0]
+                multiple_testloader.append(testloader_one)
 
-    # Process 0
-    if rank in [-1, 0]:
-        testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
-                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
-                                       world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '))[0]
-
-        if not opt.resume:
-            labels = np.concatenate(dataset.labels, 0)
-            c = torch.tensor(labels[:, 0])  # classes
-            # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
-            # model._initialize_biases(cf.to(device))
-            if plots:
-                plot_labels(labels, names, save_dir, loggers)
-                if tb_writer:
-                    tb_writer.add_histogram('classes', c, 0)
-
-            # Anchors
+                if not opt.resume:
+                    labels = np.concatenate(dataset_one.labels, 0)
+                    c = torch.tensor(labels[:, 0])  # classes
+                    # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
+                    # model._initialize_biases(cf.to(device))
+                    if plots:
+                        plot_labels(labels, multiple_names[i], save_dir, loggers, str(i+1) + '_')
+                        if tb_writer:
+                            tb_writer.add_histogram('classes_' + str(i+1), c, 0)
+        # Anchors
+        if (rank in [-1, 0]) and (not opt.resume):
             if not opt.noautoanchor:
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+                check_anchors_multiple(multiple_dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
@@ -223,45 +287,92 @@ def train(hyp, opt, device, tb_writer=None):
                     find_unused_parameters=any(isinstance(layer, nn.MultiheadAttention) for layer in model.modules()))
 
     # Model parameters
+    # I have no idea what these parameters for
     hyp['box'] *= 3. / nl  # scale to layers
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
     hyp['label_smoothing'] = opt.label_smoothing
+    model.n_dataset = n_dataset  # attach number of datasets to model
     model.nc = nc  # attach number of classes to model
+    if n_dataset > 1:
+        model.multiple_nc = multiple_nc  # attach number of classes of each dataset to model
     model.hyp = hyp  # attach hyperparameters to model
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    if n_dataset == 1:
+        model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    else:
+        multiple_class_weights = []
+        for i in range(n_dataset):
+            w = labels_to_class_weights(multiple_dataset[i].labels, multiple_nc[i]).to(device) * multiple_nc[i]
+            multiple_class_weights.append(w)
+        model.multiple_class_weights = multiple_class_weights
     model.names = names
-
+    if n_dataset > 1:
+        model.multiple_names = multiple_names  # names in each dataset
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(nc)  # mAP per class
+    if n_dataset > 1:
+        multiple_maps = []
+        for i in range(n_dataset):
+            maps_one = np.zeros(multiple_nc[i])
+            multiple_maps.append(maps_one)
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    if n_dataset > 1:
+        multiple_results = []
+        for i in range(n_dataset):
+            r = (0, 0, 0, 0, 0, 0, 0)
+            multiple_results.append(r)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
-    compute_loss = ComputeLoss(model)  # init loss class
-    logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
-                f'Using {dataloader.num_workers} dataloader workers\n'
-                f'Logging results to {save_dir}\n'
-                f'Starting training for {epochs} epochs...')
+    if n_dataset == 1:
+        compute_loss = ComputeLoss(model)  # init loss class
+    else:
+        compute_loss = ComputeLossMultiple(model)  # init loss class
+    if n_dataset == 1:
+        logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
+                    f'Using {dataloader.num_workers} dataloader workers\n'
+                    f'Logging results to {save_dir}\n'
+                    f'Starting training for {epochs} epochs...')
+    else:
+        logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
+                    f'Logging results to {save_dir}\n'
+                    f'Starting training for {epochs} epochs...')
+        for i in range(n_dataset):
+            logger.info(f'Using {multiple_dataloader[i].num_workers} dataloader workers for dataset {i+1}.\n')
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
         # Update image weights (optional)
         if opt.image_weights:
             # Generate indices
-            if rank in [-1, 0]:
-                cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
-                iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
-                dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
-            # Broadcast if DDP
-            if rank != -1:
-                indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
-                dist.broadcast(indices, 0)
-                if rank != 0:
-                    dataset.indices = indices.cpu().numpy()
+            if n_dataset == 1:
+                if rank in [-1, 0]:
+                    cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
+                    iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
+                    dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
+                # Broadcast if DDP
+                if rank != -1:
+                    indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
+                    dist.broadcast(indices, 0)
+                    if rank != 0:
+                        dataset.indices = indices.cpu().numpy()
+            else:
+                for i in range(n_dataset):
+                    if rank in [-1, 0]:
+                        cw = model.multiple_class_weights[i].cpu().numpy() * (1 - multiple_maps[i]) ** 2 / multiple_nc[i]  # class weights
+                        iw = labels_to_image_weights(multiple_dataset[i].labels, nc=multiple_nc[i], class_weights=cw)  # image weights
+                        multiple_dataset[i].indices = random.choices(range(multiple_dataset[i].n), weights=iw, k=multiple_dataset[i].n)  # rand weighted idx
+                    # Broadcast if DDP
+                    if rank != -1:
+                        indices = (torch.tensor(multiple_dataset[i].indices) if rank == 0 else torch.zeros(multiple_dataset[i].n)).int()
+                        dist.broadcast(indices, 0)
+                        if rank != 0:
+                            multiple_dataset[i].indices = indices.cpu().numpy()
+
 
         # Update mosaic border
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
@@ -269,13 +380,25 @@ def train(hyp, opt, device, tb_writer=None):
 
         mloss = torch.zeros(4, device=device)  # mean losses
         if rank != -1:
-            dataloader.sampler.set_epoch(epoch)
-        pbar = enumerate(dataloader)
+            if n_dataset == 1:
+                dataloader.sampler.set_epoch(epoch)
+            else:
+                for i in range(n_dataset):
+                    multiple_dataloader[i].sampler.set_epoch(epoch)
+        if n_dataset == 1:
+            pbar = enumerate(dataloader)
+        else:
+            datafusion = DataloaderFusion(multiple_dataloader)
+            pbar = enumerate(datafusion)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, databatch in pbar:  # batch -------------------------------------------------------------
+            if n_dataset == 1:
+                (imgs, targets, paths, _) = databatch
+            else:
+                (imgs, targets, paths, _), dataset_idx = databatch
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
@@ -301,7 +424,10 @@ def train(hyp, opt, device, tb_writer=None):
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                if n_dataset == 1:
+                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                else:
+                    loss, loss_items = compute_loss(pred, targets.to(device), dataset_idx)  # loss scaled by batch_size
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -327,12 +453,19 @@ def train(hyp, opt, device, tb_writer=None):
                 pbar.set_description(s)
 
                 # Plot
-                if plots and ni < 3:
-                    f = save_dir / f'train_batch{ni}.jpg'  # filename
-                    Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
-                    # if tb_writer:
-                    #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
-                    #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
+                if plots and ni < 5:
+                    if n_dataset == 1:
+                        f = save_dir / f'train_batch{ni}.jpg'  # filename
+                        Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
+                        # if tb_writer:
+                        #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
+                        #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
+                    else:
+                        f = save_dir / f'train_batch{ni}_{dataset_idx}.jpg'  # filename
+                        Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
+                        # if tb_writer:
+                        #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
+                        #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
                                                   save_dir.glob('train*.jpg') if x.exists()]})
@@ -347,22 +480,48 @@ def train(hyp, opt, device, tb_writer=None):
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
             # mAP
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
+            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights', 'multiple_nc', 'multiple_names'])
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
-                results, maps, times = test.test(data_dict,
-                                                 batch_size=batch_size * 2,
-                                                 imgsz=imgsz_test,
-                                                 model=ema.ema,
-                                                 single_cls=opt.single_cls,
-                                                 dataloader=testloader,
-                                                 save_dir=save_dir,
-                                                 verbose=nc < 50 and final_epoch,
-                                                 plots=plots and final_epoch,
-                                                 wandb_logger=wandb_logger,
-                                                 compute_loss=compute_loss,
-                                                 is_coco=is_coco)
+                if n_dataset == 1:
+                    results, maps, times = test.test(data_dict,
+                                                    batch_size=batch_size * 2,
+                                                    imgsz=imgsz_test,
+                                                    model=ema.ema,
+                                                    single_cls=opt.single_cls,
+                                                    dataloader=testloader,
+                                                    save_dir=save_dir,
+                                                    verbose=nc < 50 and final_epoch,
+                                                    plots=plots and final_epoch,
+                                                    wandb_logger=wandb_logger,
+                                                    compute_loss=compute_loss,
+                                                    is_coco=is_coco)
+                else:
+                    multiple_results, multiple_maps, multiple_times = [], [], []
+                    for didx in range(n_dataset):
+                        results_one, maps_one, times_one = test.test_onedataset(data_dict,
+                                                                                batch_size=batch_size * 2,
+                                                                                imgsz=imgsz_test,
+                                                                                model=ema.ema,
+                                                                                single_cls=opt.single_cls,
+                                                                                dataloader=multiple_testloader[didx],
+                                                                                save_dir=save_dir,
+                                                                                verbose=nc < 50 and final_epoch,
+                                                                                plots=plots and final_epoch,
+                                                                                wandb_logger=wandb_logger,
+                                                                                compute_loss=compute_loss,
+                                                                                is_coco=is_coco,
+                                                                                dataset_idx=didx)
+                        multiple_results.append(results_one)
+                        multiple_maps.append(maps_one)
+                        multiple_times.append(times_one)
+                    results = []
+                    for i in range(7):
+                        list_values = [res[i] for res in multiple_results]
+                        results.append(sum(list_values) / len(list_values))
+                    results = tuple(results)
+                    # No need to compute average maps as we only use multiple_maps to update classes's weight
 
             # Write
             with open(results_file, 'a') as f:
@@ -422,18 +581,42 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
             for m in (last, best) if best.exists() else (last):  # speed, mAP tests
-                results, _, _ = test.test(opt.data,
-                                          batch_size=batch_size * 2,
-                                          imgsz=imgsz_test,
-                                          conf_thres=0.001,
-                                          iou_thres=0.7,
-                                          model=attempt_load(m, device).half(),
-                                          single_cls=opt.single_cls,
-                                          dataloader=testloader,
-                                          save_dir=save_dir,
-                                          save_json=True,
-                                          plots=False,
-                                          is_coco=is_coco)
+                if n_dataset == 1:
+                    results, _, _ = test.test(opt.data,
+                                            batch_size=batch_size * 2,
+                                            imgsz=imgsz_test,
+                                            conf_thres=0.001,
+                                            iou_thres=0.7,
+                                            model=attempt_load(m, device).half(),
+                                            single_cls=opt.single_cls,
+                                            dataloader=testloader,
+                                            save_dir=save_dir,
+                                            save_json=True,
+                                            plots=False,
+                                            is_coco=is_coco)
+                else:
+                    multiple_results = []
+                    for didx in range(n_dataset):
+                        results_one, _, _ = test.test_onedataset(opt.data,
+                                                                batch_size=batch_size * 2,
+                                                                imgsz=imgsz_test,
+                                                                conf_thres=0.001,
+                                                                iou_thres=0.7,
+                                                                model=attempt_load(m, device).half(),
+                                                                single_cls=opt.single_cls,
+                                                                dataloader=testloader[didx],
+                                                                save_dir=save_dir,
+                                                                save_json=True,
+                                                                plots=False,
+                                                                is_coco=is_coco,
+                                                                dataset_idx=didx)
+                        multiple_results.append(results_one)
+
+                    results = []
+                    for i in range(7):
+                        list_values = [res[i] for res in multiple_results]
+                        results.append(sum(list_values) / len(list_values))
+                    results = tuple(results)
 
         # Strip optimizers
         final = best if best.exists() else last  # final model

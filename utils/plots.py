@@ -271,7 +271,7 @@ def plot_study_txt(path='', x=None):  # from utils.plots import *; plot_study_tx
     plt.savefig(str(Path(path).name) + '.png', dpi=300)
 
 
-def plot_labels(labels, names=(), save_dir=Path(''), loggers=None):
+def plot_labels(labels, names=(), save_dir=Path(''), loggers=None, filename_prefix=''):
     # plot dataset labels
     print('Plotting labels... ')
     c, b = labels[:, 0], labels[:, 1:].transpose()  # classes, boxes
@@ -281,7 +281,7 @@ def plot_labels(labels, names=(), save_dir=Path(''), loggers=None):
 
     # seaborn correlogram
     sns.pairplot(x, corner=True, diag_kind='auto', kind='hist', diag_kws=dict(bins=50), plot_kws=dict(pmax=0.9))
-    plt.savefig(save_dir / 'labels_correlogram.jpg', dpi=200)
+    plt.savefig(save_dir / (filename_prefix + 'labels_correlogram.jpg'), dpi=200)
     plt.close()
 
     # matplotlib labels
@@ -310,7 +310,7 @@ def plot_labels(labels, names=(), save_dir=Path(''), loggers=None):
         for s in ['top', 'right', 'left', 'bottom']:
             ax[a].spines[s].set_visible(False)
 
-    plt.savefig(save_dir / 'labels.jpg', dpi=200)
+    plt.savefig(save_dir / (filename_prefix + 'labels.jpg'), dpi=200)
     matplotlib.use('Agg')
     plt.close()
 
