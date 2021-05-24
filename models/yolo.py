@@ -148,9 +148,8 @@ class Model(nn.Module):
             self.stride = m.stride
             self._initialize_biases()  # only run once
             # logger.info('Strides: %s' % m.stride.tolist())
-        
+
         if isinstance(m, DetectMultiple):
-            # TODO
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             m.anchors /= m.stride.view(-1, 1, 1)
@@ -225,9 +224,9 @@ class Model(nn.Module):
                 b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
                 for didx in range(n_dataset):
                     start, end = slice_index[didx]
-                b.data[:, start+4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-                b.data[:, start+5:end] += math.log(0.6 / (multiple_nc[didx] - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
-                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+                    b.data[:, start+4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+                    b.data[:, start+5:end] += math.log(0.6 / (multiple_nc[didx] - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+                    mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
         m = self.model[-1]  # Detect() module
@@ -279,7 +278,16 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+
+    n_dataset = d.get('n_dataset', 1)
+    if n_dataset == 1:
+        no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    else:
+        multiple_nc = []
+        for i in range(n_dataset):
+            multiple_nc.append(int(d['nc_'+str(i+1)]))
+        multiple_no = [na*(x+5) for x in multiple_nc]
+        no = sum(multiple_no)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
