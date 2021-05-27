@@ -250,7 +250,7 @@ def train(hyp, opt, device, tb_writer=None):
                                                 world_size=opt.world_size, workers=opt.workers,
                                                 image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train_' + str(i+1) + ': '))
             mlc = np.concatenate(dataset_one.labels, 0)[:, 0].max()  # max label class
-            nb += len(dataloader_one)  # number of batches
+            nb = max(nb, len(dataloader_one))  # number of batches
             assert mlc < multiple_nc[i], 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, multiple_nc[i], opt.data, nc - 1)
 
             multiple_dataloader.append(dataloader_one)
@@ -342,6 +342,9 @@ def train(hyp, opt, device, tb_writer=None):
                     f'Starting training for {epochs} epochs...')
         for i in range(n_dataset):
             logger.info(f'Using {multiple_dataloader[i].num_workers} dataloader workers for dataset {i+1}.\n')
+    
+    if n_dataset > 1:
+        datafusion = DataloaderFusion(multiple_dataloader)
 
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
@@ -388,7 +391,6 @@ def train(hyp, opt, device, tb_writer=None):
         if n_dataset == 1:
             pbar = enumerate(dataloader)
         else:
-            datafusion = DataloaderFusion(multiple_dataloader)
             pbar = enumerate(datafusion)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
@@ -398,7 +400,7 @@ def train(hyp, opt, device, tb_writer=None):
             if n_dataset == 1:
                 (imgs, targets, paths, _) = databatch
             else:
-                (imgs, targets, paths, _), dataset_idx = databatch
+                (imgs, targets, paths, _), p_slice, targets_slice = databatch
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
@@ -427,7 +429,7 @@ def train(hyp, opt, device, tb_writer=None):
                 if n_dataset == 1:
                     loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 else:
-                    loss, loss_items = compute_loss(pred, targets.to(device), dataset_idx)  # loss scaled by batch_size
+                    loss, loss_items = compute_loss(pred, targets.to(device), p_slice, targets_slice)  # loss scaled by batch_size
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -461,11 +463,14 @@ def train(hyp, opt, device, tb_writer=None):
                         #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                         #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
                     else:
-                        f = save_dir / f'train_batch{ni}_{dataset_idx}.jpg'  # filename
-                        Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
-                        # if tb_writer:
-                        #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
-                        #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
+                        for dataset_idx in range(n_dataset):
+                            f = save_dir / f'train_batch{ni}_{dataset_idx}.jpg'  # filename
+                            start, end = p_slice[dataset_idx]
+                            t_start, t_end = targets_slice[dataset_idx]
+                            Thread(target=plot_images, args=(imgs[start:end], targets[t_start:t_end], paths[start:end], f), daemon=True).start()
+                            # if tb_writer:
+                            #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
+                            #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
                                                   save_dir.glob('train*.jpg') if x.exists()]})

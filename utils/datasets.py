@@ -1068,19 +1068,16 @@ class DataloaderFusion:
     def __init__(self, list_dataloader):
         self.list_dataloader = list_dataloader
         self.list_iter = [iter(ld) for ld in self.list_dataloader]
-        self.n_dataset = len(list_dataloader)
-        self.len = 0
-        self.load_order = []
-        for i, dl in enumerate(list_dataloader):
-            self.len += len(dl)
-            self.load_order += [i for _ in range(len(dl))]
-        random.shuffle(self.load_order)
+        self.n_dataset = len(self.list_dataloader)
+        lens = [len(dl) for dl in self.list_dataloader]
+        self.len = max(lens)
         self.idx = -1
 
     def __len__(self):
         return self.len
 
     def __iter__(self):
+        self.idx = -1  # this will not work if we use more than one thread
         return self
 
     def __next__(self):
@@ -1088,6 +1085,26 @@ class DataloaderFusion:
         if self.idx >= self.len:
             raise StopIteration
         else:
-            dataset_idx = self.load_order[self.idx]
-            data = next(self.list_iter[dataset_idx])
-            return data, dataset_idx
+            list_imgs = []
+            list_targets = []
+            list_paths = []
+            p_slice = []
+            targets_slice = []
+            slice_idx = 0
+            p_idx = 0
+            for didx in range(self.n_dataset):
+                try:
+                    (imgs, targets, paths, _) = next(self.list_iter[didx])
+                except StopIteration:
+                    self.list_iter[didx] = iter(self.list_dataloader[didx])
+                    (imgs, targets, paths, _) = next(self.list_iter[didx])
+                list_imgs.append(imgs)
+                list_targets.append(targets)
+                list_paths.extend(paths)
+                p_slice.append([p_idx, p_idx + imgs.shape[0]])
+                p_idx += imgs.shape[0]
+                targets_slice.append([slice_idx, slice_idx + targets.shape[0]])
+                slice_idx += targets.shape[0]
+            list_imgs = torch.cat(list_imgs, 0)
+            list_targets = torch.cat(list_targets, 0)
+            return (list_imgs, list_targets, list_paths, []), p_slice, targets_slice

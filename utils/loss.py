@@ -358,15 +358,24 @@ class ComputeLossMultiple:
         for i in range(self.n_dataset):
             loss = ComputeLossComponent(model, False, self.multiple_nc[i])
             self.component_losses.append(loss)
-        self.slice_index = []
+        self.slice_index = []  # slice indies in each output
         start = 0
         for n in self.multiple_nc:
             self.slice_index.append([start, start+n+5])
             start += (n+5)
-        print('self.slice_index:', self.slice_index)
 
-    def __call__(self, p, targets, dataset_idx):
-        # select correpeonding prediction part
-        start, end = self.slice_index[dataset_idx]
-        p = [layer[:, :, :, :, start:end] for layer in p]
-        return self.component_losses[dataset_idx](p, targets)
+    def __call__(self, p, targets, p_slice, targets_slice):
+        # p_slice: slice index for each dataset
+        # targets_slice: slice index for each dataset
+        multiple_loss = []
+        multiple_loss_item = 0
+        for didx in range(self.n_dataset):
+            start, end = self.slice_index[didx]
+            start_p_dataset, end_p_dataset = p_slice[didx]
+            start_target_dataset, end_target_dataset = targets_slice[didx]
+            _targets = targets[start_target_dataset:end_target_dataset]
+            _p = [layer[start_p_dataset:end_p_dataset][:, :, :, :, start:end] for layer in p]
+            loss, loss_item = self.component_losses[didx](_p, _targets)
+            multiple_loss.append(loss)
+            multiple_loss_item += loss_item
+        return sum(multiple_loss) / self.n_dataset, multiple_loss_item / self.n_dataset
