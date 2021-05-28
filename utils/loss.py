@@ -364,18 +364,25 @@ class ComputeLossMultiple:
             self.slice_index.append([start, start+n+5])
             start += (n+5)
 
-    def __call__(self, p, targets, p_slice, targets_slice):
+    def __call__(self, p, targets, p_slice=None, targets_slice=None, dataset_idx=None):
         # p_slice: slice index for each dataset
         # targets_slice: slice index for each dataset
-        multiple_loss = []
-        multiple_loss_item = 0
-        for didx in range(self.n_dataset):
-            start, end = self.slice_index[didx]
-            start_p_dataset, end_p_dataset = p_slice[didx]
-            start_target_dataset, end_target_dataset = targets_slice[didx]
-            _targets = targets[start_target_dataset:end_target_dataset]
-            _p = [layer[start_p_dataset:end_p_dataset][:, :, :, :, start:end] for layer in p]
-            loss, loss_item = self.component_losses[didx](_p, _targets)
-            multiple_loss.append(loss)
-            multiple_loss_item += loss_item
-        return sum(multiple_loss) / self.n_dataset, multiple_loss_item / self.n_dataset
+        if p_slice is not None and targets_slice is not None:
+            multiple_loss = []
+            multiple_loss_item = 0
+            for didx in range(self.n_dataset):
+                start, end = self.slice_index[didx]
+                start_p_dataset, end_p_dataset = p_slice[didx]
+                start_target_dataset, end_target_dataset = targets_slice[didx]
+                _targets = targets[start_target_dataset:end_target_dataset]
+                _p = [layer[start_p_dataset:end_p_dataset][:, :, :, :, start:end] for layer in p]
+                loss, loss_item = self.component_losses[didx](_p, _targets)
+                multiple_loss.append(loss)
+                multiple_loss_item += loss_item
+            return sum(multiple_loss) / self.n_dataset, multiple_loss_item / self.n_dataset
+        elif dataset_idx is not None:
+            start, end = self.slice_index[dataset_idx]
+            _p = [layer[:, :, :, :, start:end] for layer in p]
+            return self.component_losses[dataset_idx](_p, targets)
+        else:
+            raise ValueError('At least p_slice and targets_slice must not be None or dataset_idx must not be None')
