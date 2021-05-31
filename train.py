@@ -485,7 +485,7 @@ def train(hyp, opt, device, tb_writer=None):
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
             # mAP
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights', 'multiple_nc', 'multiple_names'])
+            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights', 'multiple_nc', 'multiple_names', 'n_dataset'])
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
