@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 import torch
+import torchvision
 import torch.backends.cudnn as cudnn
 from numpy import random
 
@@ -13,6 +14,25 @@ from utils.general import check_img_size, check_requirements, check_imshow, non_
     scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path, save_one_box
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized
+
+
+def nms_between_dataset(list_pred, iou_thres):
+    n_dataset = len(list_pred)
+    batch_size = len(list_pred[0])
+    for i in range(batch_size):
+        list_detection = [list_pred[j][i] for j in range(n_dataset)]
+        all_detection = torch.cat(list_detection, axis=0)
+        boxes = all_detection[:, :4]
+        scores = all_detection[:, 4]
+        indices = torchvision.ops.nms(boxes, scores, iou_thres)
+        min_index = 0
+        for j in range(n_dataset):
+            n_detection = len(list_pred[j][i])
+            max_index = min_index + n_detection
+            selected_indices = torch.logical_and(indices >= min_index, indices < max_index)
+            list_pred[j][i] = all_detection[indices[selected_indices]]
+            min_index = max_index
+    return list_pred
 
 
 def detect(opt):
@@ -56,7 +76,6 @@ def detect(opt):
     names = model.module.names if hasattr(model, 'module') else model.names
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in names]
 
-    # TODO Remove this
     n_dataset = model.n_dataset if hasattr(model, 'n_dataset') else 1
 
     if n_dataset > 1:
@@ -93,6 +112,8 @@ def detect(opt):
                 pred_one = pred[:, :, start:end]
                 pred_one = non_max_suppression(pred_one, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
                 list_pred.append(pred_one)
+            if opt.agnostic_nms:
+                list_pred = nms_between_dataset(list_pred, opt.iou_thres)
         t2 = time_synchronized()
 
         # Apply Classifier
