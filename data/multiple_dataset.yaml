@@ -1,7 +1,7 @@
 # total number of classes
 nc: 6
 
-# numver of datasets
+# number of datasets
 n_dataset: 2
 
 # train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
@@ -13,7 +13,7 @@ train_2: custom_dataset/vehicle_train.txt
 val_2: custom_dataset/vehicle_val.txt
 test_2: custom_dataset/vehicle_val.txt
 
-# numver of classes for each dataset
+# number of classes for each dataset
 
 nc_1: 1
 nc_2: 5
